@@ -1,0 +1,94 @@
+{
+  "tested_at": "2026-10-19T21:19:35.451808+00:00",
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "revision": "0eda42d56fb8f68eb4f6d5a86019402bdd53330e",
+  "envoy_version": "0eda42d56fb8f68eb4f6d5a86019402bdd53330e/1.41.0-dev/Modified/RELEASE/BoringSSL",
+  "envoy_sha256": "b25e16f9cb8595a7a7136e33bfd0f40b399120da9d21810a926c494ff91a4197",
+  "module_sha256": "32102533a77b87967341380b40335bef50c2ef4f9bba771617bde5735286327f",
+  "patch_sha256": "889092d09655f15e8cd5ea548f6001d55ec8d90d61b14c3e87877f11395576da",
+  "cases": [
+    {
+      "case": "default-route",
+      "status": 200,
+      "attempts": 2
+    },
+    {
+      "case": "deny",
+      "status": 503,
+      "attempts": 1
+    },
+    {
+      "case": "allow",
+      "status": 200,
+      "attempts": 2
+    },
+    {
+      "case": "outcome-aware",
+      "status": 500,
+      "attempts": 2
+    },
+    {
+      "case": "default-sequence",
+      "status": 200,
+      "attempts": 3
+    },
+    {
+      "case": "history-different",
+      "status": 200,
+      "attempts": 3
+    },
+    {
+      "case": "history-repeated",
+      "status": 503,
+      "attempts": 2
+    },
+    {
+      "case": "default-repeated",
+      "status": 200,
+      "attempts": 3
+    },
+    {
+      "case": "retry-limit",
+      "status": 503,
+      "attempts": 3
+    },
+    {
+      "case": "runtime-veto",
+      "status": 503,
+      "attempts": 1
+    },
+    {
+      "case": "runtime-default",
+      "status": 503,
+      "attempts": 1
+    },
+    {
+      "case": "runtime-restored",
+      "status": 200,
+      "attempts": 2
+    },
+    {
+      "case": "circuit-breaker-veto",
+      "status": 503,
+      "attempts": 1
+    },
+    {
+      "case": "deadline",
+      "status": 504,
+      "attempts": 1
+    },
+    {
+      "case": "cancelled",
+      "attempts": 1
+    },
+    {
+      "case": "invalid-policy",
+      "status": 400,
+      "attempts": 0
+    },
+    {
+      "case": "concurrent-isolation",
+      "requests": 32
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+node: {id: attempt-policy-poc, cluster: attempt-policy-poc}
+admin:
+  address:
+    socket_address: {address: 127.0.0.1, port_value: 9901}
+layered_runtime:
+  layers:
+  - name: admin
+    admin_layer: {}
+static_resources:
+  clusters:
+  - name: synthetic
+    type: STATIC
+    connect_timeout: 1s
+    circuit_breakers:
+      thresholds:
+      - priority: DEFAULT
+        max_retries: 64
+    load_assignment:
+      cluster_name: synthetic
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: {address: 127.0.0.1, port_value: 18000}
+  listeners:
+  - name: http
+    address:
+      socket_address: {address: 127.0.0.1, port_value: 10000}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: attempt_demo
+          route_config:
+            name: same-route
+            virtual_hosts:
+            - name: local
+              domains: ["*"]
+              include_attempt_count_in_response: true
+              routes:
+              - match: {prefix: /}
+                route:
+                  cluster: synthetic
+                  timeout: 1s
+                  retry_policy:
+                    retry_on: 5xx
+                    num_retries: 2
+                    retry_back_off: {base_interval: 0.01s, max_interval: 0.02s}
+          http_filters:
+          - name: envoy.filters.http.dynamic_modules
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
+              dynamic_module_config:
+                name: attempt_policy
+                do_not_close: true
+              filter_name: attempt_policy
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

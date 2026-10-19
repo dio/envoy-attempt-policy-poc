@@ -1,0 +1,250 @@
+diff --git a/source/common/router/BUILD b/source/common/router/BUILD
+index ee3e02f8..7d8cd508 100644
+--- a/source/common/router/BUILD
++++ b/source/common/router/BUILD
+@@ -372,6 +372,7 @@ envoy_cc_library(
+     srcs = ["retry_state_impl.cc"],
+     hdrs = ["retry_state_impl.h"],
+     deps = [
++        ":string_accessor_lib",
+         "//envoy/event:timer_interface",
+         "//envoy/http:codec_interface",
+         "//envoy/http:header_map_interface",
+@@ -413,6 +414,7 @@ envoy_cc_library(
+         "upstream_request.h",
+     ],
+     deps = [
++        ":string_accessor_lib",
+         ":context_lib",
+         ":debug_config_lib",
+         ":header_parser_lib",
+@@ -580,7 +582,7 @@ envoy_cc_library(
+ 
+ envoy_cc_library(
+     name = "string_accessor_lib",
+-    hdrs = ["string_accessor_impl.h"],
++    hdrs = ["string_accessor_impl.h", "attempt_policy.h"],
+     deps = [
+         "//envoy/router:string_accessor_interface",
+     ],
+diff --git a/source/common/router/attempt_policy.h b/source/common/router/attempt_policy.h
+new file mode 100644
+index 00000000..ae94aff5
+--- /dev/null
++++ b/source/common/router/attempt_policy.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cstdint>
++
++#include "envoy/stream_info/filter_state.h"
++
++namespace Envoy {
++namespace Router {
++
++// Experimental PoC interface, not a proposed stable dynamic-module ABI.
++class AttemptPolicy : public StreamInfo::FilterState::Object {
++public:
++  using Callback = uint64_t (*)(uint64_t, uint32_t, uint32_t);
++  static constexpr const char* Key = "envoy.router.attempt_policy_poc";
++  AttemptPolicy(uint64_t token, Callback callback) : token_(token), callback_(callback) {}
++  // Zero denies; otherwise delay in milliseconds plus one. Called on the worker.
++  uint64_t decide(uint32_t reason, uint32_t status) const { return callback_(token_, reason, status); }
++  const uint64_t token_;
++  const Callback callback_;
++};
++
++} // namespace Router
++} // namespace Envoy
+diff --git a/source/common/router/retry_state_impl.cc b/source/common/router/retry_state_impl.cc
+index 01620b0d..4b1c49cd 100644
+--- a/source/common/router/retry_state_impl.cc
++++ b/source/common/router/retry_state_impl.cc
+@@ -162,6 +162,11 @@ void RetryStateImpl::enableBackoffTimer() {
+     retry_timer_ = dispatcher_.createTimer([this]() -> void { backoff_callback_(); });
+   }
+ 
++  if (configured_delay_) {
++    retry_timer_->enableTimer(*configured_delay_);
++    configured_delay_.reset();
++    return;
++  }
+   if (ratelimited_backoff_strategy_ != nullptr) {
+     // If we have a backoff strategy based on rate limit feedback from the response we use it.
+     retry_timer_->enableTimer(
+@@ -305,9 +310,19 @@ RetryStatus RetryStateImpl::shouldRetry(RetryDecision would_retry, DoRetryCallba
+   return RetryStatus::Yes;
+ }
+ 
++RetryStatus RetryStateImpl::configuredRetry(uint32_t reason, uint32_t status, DoRetryCallback callback) {
++  const uint64_t decision = attempt_policy_->decide(reason, status);
++  if (decision == 0 || decision > 600001) { return RetryStatus::No; }
++  configured_delay_ = std::chrono::milliseconds(decision - 1);
++  return shouldRetry(decision == 1 ? RetryDecision::RetryImmediately : RetryDecision::RetryWithBackoff, callback);
++}
++
+ RetryStatus RetryStateImpl::shouldRetryHeaders(const Http::ResponseHeaderMap& response_headers,
+                                                const Http::RequestHeaderMap& original_request,
+                                                DoRetryHeaderCallback callback) {
++  if (attempt_policy_) {
++    return configuredRetry(0, Http::Utility::getResponseStatus(response_headers), [callback]() { callback(false); });
++  }
+   // This may be overridden in wouldRetryFromHeaders().
+   bool disable_early_data = false;
+   const RetryDecision retry_decision =
+@@ -331,6 +346,14 @@ RetryStatus RetryStateImpl::shouldRetryReset(Http::StreamResetReason reset_reaso
+                                              Http3Used http3_used, DoRetryResetCallback callback,
+                                              bool upstream_request_started) {
+ 
++  if (attempt_policy_) {
++    uint32_t reason = 0;
++    if (attempt_timeout_) { reason = 3; }
++    else if ((reset_reason == Http::StreamResetReason::LocalConnectionFailure || reset_reason == Http::StreamResetReason::RemoteConnectionFailure)) { reason = 1; }
++    else if (reset_reason == Http::StreamResetReason::RemoteReset || reset_reason == Http::StreamResetReason::ConnectionTermination || reset_reason == Http::StreamResetReason::RemoteRefusedStreamReset) { reason = 2; }
++    if (reason == 0) { return RetryStatus::No; }
++    return configuredRetry(reason, 0, [callback]() { callback(false); });
++  }
+   // Following wouldRetryFromReset() may override the value.
+   bool disable_http3 = false;
+   const RetryDecision retry_decision =
+diff --git a/source/common/router/retry_state_impl.h b/source/common/router/retry_state_impl.h
+index 7ece1a29..a75dbfd5 100644
+--- a/source/common/router/retry_state_impl.h
++++ b/source/common/router/retry_state_impl.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include "source/common/router/attempt_policy.h"
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -60,6 +61,8 @@ public:
+    */
+   static std::vector<std::string> getUnknownRetryOnTokens(absl::string_view config);
+ 
++  void setAttemptPolicy(const AttemptPolicy* p) { attempt_policy_ = p; }
++  void setAttemptTimeout(bool value) { attempt_timeout_ = value; }
+   // Router::RetryState
+   bool enabled() override { return retry_on_ != 0; }
+   std::optional<std::chrono::milliseconds>
+@@ -125,6 +128,10 @@ private:
+                                     bool upstream_request_started);
+   RetryStatus shouldRetry(RetryDecision would_retry, DoRetryCallback callback);
+ 
++  RetryStatus configuredRetry(uint32_t reason, uint32_t status, DoRetryCallback callback);
++  const AttemptPolicy* attempt_policy_{nullptr};
++  bool attempt_timeout_{false};
++  std::optional<std::chrono::milliseconds> configured_delay_;
+   const Upstream::ClusterInfo& cluster_;
+   Runtime::Loader& runtime_;
+   Random::RandomGenerator& random_;
+diff --git a/source/common/router/router.cc b/source/common/router/router.cc
+index 368621ee..3f25d274 100644
+--- a/source/common/router/router.cc
++++ b/source/common/router/router.cc
+@@ -851,6 +851,9 @@ bool Filter::continueDecodeHeaders(Http::RequestHeaderMap& headers, bool end_str
+   retry_state_ =
+       createRetryState(*effective_retry_policy, headers, *cluster_, config_->factory_context_,
+                        callbacks_->dispatcher(), route_entry_->priority());
++  if (auto* impl = dynamic_cast<RetryStateImpl*>(retry_state_.get())) {
++    impl->setAttemptPolicy(callbacks_->streamInfo().filterState()->getDataReadOnly<AttemptPolicy>(AttemptPolicy::Key));
++  }
+   if (retry_state_ != nullptr) {
+     // Cross-cluster retry is enabled only if the retry policy requests cluster refresh and hedging
+     // is not active (hedging with cross-cluster retry is not supported).
+@@ -1655,6 +1658,9 @@ bool Filter::maybeRetryReset(Http::StreamResetReason reset_reason,
+                                    ->upstreamTiming()
+                                    .first_upstream_tx_byte_sent_.has_value();
+ 
++  if (auto* impl = dynamic_cast<RetryStateImpl*>(retry_state_.get())) {
++    impl->setAttemptTimeout(is_timeout_retry == TimeoutRetry::Yes);
++  }
+   const RetryStatus retry_status = retry_state_->shouldRetryReset(
+       reset_reason, was_using_http3,
+       [this, can_send_early_data = upstream_request.upstreamStreamOptions().can_send_early_data_,
+diff --git a/source/extensions/dynamic_modules/sdk/go/abi/internal.go b/source/extensions/dynamic_modules/sdk/go/abi/internal.go
+index bca91e66..826f2ad6 100644
+--- a/source/extensions/dynamic_modules/sdk/go/abi/internal.go
++++ b/source/extensions/dynamic_modules/sdk/go/abi/internal.go
+@@ -9,6 +9,7 @@ package abi
+ #include "../../../abi/abi.h"
+ 
+ typedef const envoy_dynamic_module_type_envoy_buffer* ConstEnvoyBufferPtr;
++bool envoy_dynamic_module_callback_http_attempt_policy_poc(envoy_dynamic_module_type_http_filter_envoy_ptr, uint64_t, uintptr_t);
+ */
+ import "C"
+ import (
+@@ -49,7 +50,8 @@ type manager[T any] struct {
+ }
+ 
+ func (m *manager[T]) record(item *T) unsafe.Pointer {
+-	pointer := unsafe.Pointer(item)
++	// C retains only an opaque C allocation, never a pointer into Go memory.
++	pointer := C.malloc(1)
+ 	index := uintptr(pointer) % numManagerShards
+ 	m.mutex[index].Lock()
+ 	defer m.mutex[index].Unlock()
+@@ -59,7 +61,7 @@ func (m *manager[T]) record(item *T) unsafe.Pointer {
+ }
+ 
+ func (m *manager[T]) unwrap(itemPtr unsafe.Pointer) *T {
+-	return (*T)(itemPtr)
++	return m.search(uintptr(itemPtr))
+ }
+ 
+ func (m *manager[T]) search(key uintptr) *T {
+@@ -73,7 +75,10 @@ func (m *manager[T]) remove(itemPtr unsafe.Pointer) {
+ 	index := uintptr(itemPtr) % numManagerShards
+ 	m.mutex[index].Lock()
+ 	defer m.mutex[index].Unlock()
+-	delete(m.data[index], uintptr(itemPtr))
++	if _, exists := m.data[index][uintptr(itemPtr)]; exists {
++		delete(m.data[index], uintptr(itemPtr))
++		C.free(itemPtr)
++	}
+ }
+ 
+ func newManager[T any]() *manager[T] {
+@@ -3175,3 +3180,9 @@ func envoy_dynamic_module_on_stat_sink_config_scheduled(
+ 	}
+ 	wrapper.handle.scheduler.onScheduled(uint64(taskID))
+ }
++
++// SetRouterAttemptPolicyPoC installs an experimental request-lifetime policy.
++// callback is a C function address; token must never contain a Go pointer.
++func (h *dymHttpFilterHandle) SetRouterAttemptPolicyPoC(token uint64, callback uintptr) bool {
++	return bool(C.envoy_dynamic_module_callback_http_attempt_policy_poc(h.hostPluginPtr, C.uint64_t(token), C.uintptr_t(callback)))
++}
+diff --git a/source/extensions/filters/http/dynamic_modules/abi_impl.cc b/source/extensions/filters/http/dynamic_modules/abi_impl.cc
+index 4b4b4ff2..4f037b58 100644
+--- a/source/extensions/filters/http/dynamic_modules/abi_impl.cc
++++ b/source/extensions/filters/http/dynamic_modules/abi_impl.cc
+@@ -10,6 +10,7 @@
+ #include "source/common/http/utility.h"
+ #include "source/common/network/socket_option_impl.h"
+ #include "source/common/router/string_accessor_impl.h"
++#include "source/common/router/attempt_policy.h"
+ #include "source/common/tracing/null_span_impl.h"
+ #include "source/common/tracing/tracer_impl.h"
+ #include "source/extensions/dynamic_modules/abi/abi.h"
+@@ -3084,3 +3085,19 @@ void envoy_dynamic_module_callback_http_clear_route_cluster_cache(
+ } // namespace DynamicModules
+ } // namespace Extensions
+ } // namespace Envoy
++
++extern "C" bool envoy_dynamic_module_callback_http_attempt_policy_poc(void* raw, uint64_t token,
++                                                                     uintptr_t callback) {
++  auto* filter = static_cast<Envoy::Extensions::DynamicModules::HttpFilters::DynamicModuleHttpFilter*>(raw);
++  auto* info = filter->streamInfo();
++  if (!info || !token || !callback ||
++      info->filterState()->hasDataWithName(Envoy::Router::AttemptPolicy::Key)) {
++    return false;
++  }
++  info->filterState()->setData(
++      Envoy::Router::AttemptPolicy::Key,
++      std::make_shared<Envoy::Router::AttemptPolicy>(
++          token, reinterpret_cast<Envoy::Router::AttemptPolicy::Callback>(callback)),
++      Envoy::StreamInfo::FilterState::LifeSpan::Request);
++  return true;
++}
