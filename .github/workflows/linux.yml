@@ -1,0 +1,142 @@
+name: Linux qualification
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'validation/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'validation/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      BUILD_JOBS: '3'
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare Linux build dependencies
+        run: |
+          # These preinstalled SDKs are unused on this disposable hosted runner.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y autoconf build-essential curl libxml2-dev libtool patch python3-pip unzip virtualenv
+          df -h /
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Prepare pinned Envoy source
+        run: python3 scripts/prepare.py
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          module-root: build/envoy
+          bazelisk-cache: true
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build module and check Go code
+        run: |
+          bash scripts/build.sh
+          go vet -modfile=build/local.mod ./cmd/module ./internal/...
+          test -z "$(gofmt -l cmd internal)"
+          python3 -m py_compile scripts/*.py
+          bash -n scripts/build.sh scripts/build-envoy.sh
+
+      - name: Lint Go code
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOFLAGS: -modfile=build/local.mod
+        with:
+          version: v2.15.0
+          args: --timeout=5m ./cmd/module ./internal/...
+
+      - name: Check reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          GOFLAGS=-modfile=build/local.mod govulncheck ./cmd/module ./internal/...
+
+      - name: Cache patched Envoy binary
+        id: envoy-cache
+        uses: actions/cache@v6
+        with:
+          path: build/envoy-static
+          key: envoy-ubuntu24-${{ matrix.arch }}-${{ hashFiles('envoy-revision.txt', 'patches/**', 'envoy-build/**', 'scripts/build-envoy.sh', '.github/workflows/linux.yml') }}
+
+      - name: Build patched Envoy
+        if: steps.envoy-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build-envoy.sh 2>&1 | tee build/envoy-build.log
+
+      - name: Run smoke test
+        run: |
+          python3 scripts/smoke.py | tee build/smoke-standard.log
+          cp build/results.json build/results-standard.json
+          cp build/envoy.log build/envoy-standard.log
+
+      - name: Run smoke test with Go race detector
+        run: |
+          GOFLAGS=-race bash scripts/build.sh
+          python3 scripts/smoke.py | tee build/smoke-race.log
+          cp build/results.json build/results-race.json
+          cp build/envoy.log build/envoy-race.log
+          if grep -q 'WARNING: DATA RACE' build/envoy-race.log; then
+            exit 1
+          fi
+
+      - name: Record CI environment
+        if: always()
+        env:
+          COMMIT: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p build
+          {
+            echo "commit=$COMMIT"
+            echo "run=$RUN_URL"
+            uname -a
+            go version
+            ldd --version | head -n 1
+            df -h /
+          } > build/ci-environment.txt
+
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}-qualification
+          path: |
+            build/results*.json
+            build/*.log
+            build/ci-environment.txt
+            build/smoke.yaml
+          if-no-files-found: warn
+          retention-days: 30

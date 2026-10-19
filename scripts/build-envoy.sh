@@ -10,9 +10,8 @@ if [[ $(uname -s) == Darwin ]]; then
   if [[ $(uname -m) == arm64 ]]; then
     flags+=('--linkopt=-Wl,-exported_symbol,_envoy_dynamic_module_callback_*')
   fi
-else
-  flags+=(--config=clang)
 fi
+# The pinned Envoy revision selects its hermetic Clang toolchain by default on Linux.
 cd "$source_dir"
 bazel build --jobs="${BUILD_JOBS:-6}" -c opt --define=no_debug_info=1 --fission=no \
   --override_repository="+envoy_build_config_ext+envoy_build_config=$root/envoy-build" \

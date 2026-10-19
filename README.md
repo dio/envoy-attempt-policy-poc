@@ -80,7 +80,7 @@ It refuses to overwrite unrelated tracked edits. The Go SDK comes from that same
 prepared source tree. No application repository or external service is required.
 
 `envoy-build/` selects the extensions needed by the example and SDK host callbacks.
-On Linux the build script selects Envoy's Clang configuration; on macOS it uses
+On Linux the pinned Envoy source selects its hermetic Clang toolchain; on macOS the script uses
 the native toolchain and exports dynamic-module callback symbols.
 
 The smoke test allocates loopback ports and starts its own synthetic upstream and
@@ -99,8 +99,15 @@ The native build and all smoke cases passed on macOS arm64, including the
 32-request concurrent history test and request-token cleanup. The
 [validation record](validation/macos-arm64.json) contains the tested versions,
 artifact digests and observed results. Go vet and clean-source patch application
-checks also passed. Linux execution and upstream sanitizer suites have not been
-qualified by this PoC.
+checks also passed. Upstream C++ sanitizer suites have not been qualified by this PoC.
+
+[Linux qualification](https://github.com/dio/envoy-attempt-policy-poc/actions/workflows/linux.yml)
+runs on native Ubuntu amd64 and arm64 runners for code changes and manual dispatch.
+It builds the pinned patched Envoy and Go module, runs the same smoke test, then
+rebuilds the module with Go's race detector and repeats the integration checks.
+Each job uploads result JSON, logs and its CI environment. The Envoy binary cache
+is keyed by architecture and all pinned source/patch/build inputs; the module and
+smoke tests always run. A queued or running workflow is not a passing qualification.
 
 ## Try it manually
 
